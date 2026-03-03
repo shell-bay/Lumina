@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# LUMINA v0.5.0 — Phase 5 Demo Program
+# Filename: demo_phase5.lum
+#
+# This program shows ALL Phase 5 features:
+#   1. use keyword (module imports)
+#   2. Math functions from core.ll (pre-compiled, instant)
+#   3. Name mangling (age in main ≠ age in physics module — no collision)
+#   4. While loop with mutation
+#   5. If/else conditional
+#   6. Struct (Object Brain from Phase 4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Phase 5 Feature 1: Module Import ────────────────────────────────────────
+# The compiler looks for 'math' in /lib or the built-in core.ll
+use the math library
+use the physics library
+
+# ── Phase 5 Feature 2: Call a pre-compiled math function ───────────────────
+# "square root of x" maps to __lum_core_sqrt(x) in core.ll
+# This bypasses the Lark parser completely at runtime — C speed!
+create a decimal called x with value 144.0
+calculate root as square root of x
+show root
+
+# ── Phase 5 Feature 3: Name Mangling ────────────────────────────────────────
+# 'pi' is defined in math.lum as __lum_math_pi
+# 'pi' defined below becomes __lum_main_pi — NO COLLISION
+create a decimal called pi with value 3.14159
+create a decimal called radius with value 7.0
+calculate area as pi times radius
+show area
+
+# ── Feature 4: While Loop ───────────────────────────────────────────────────
+create a number called counter with value 1
+create a number called max_count with value 5
+
+Repeat while counter is less than max_count
+  increase counter by 1
+  show counter
+Stop
+
+# ── Feature 5: If/Else Conditional ─────────────────────────────────────────
+If area is greater than 100 then show area otherwise show root
+
+# ── Feature 6: Struct (Object Brain) ───────────────────────────────────────
+define Circle as a thing with center_x (decimal) and center_y (decimal) and radius_val (decimal)
+
+create a new Circle called my_circle
+set the center_x of my_circle to 0.0
+set the center_y of my_circle to 0.0
+set the radius_val of my_circle to 5.0
+get the radius_val of my_circle
+
+# ── Clean up ────────────────────────────────────────────────────────────────
+# (Numeric/struct variables don't need freeing — they are stack-allocated)
+# Text variables would need: free message
