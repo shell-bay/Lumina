@@ -325,6 +325,21 @@ class LLVMGeneratorP5:
 
         self._emit_c(f"CREATE_VAR '{node.name}' → mangled '{mangled}' type={lt}")
 
+        # FIX: If the node carries a binary op (from "create x with a * b"), delegate
+        # to _emit_calculate so proper fmul/fadd/etc. instructions are emitted.
+        if node.op and node.left and node.right:
+            from compiler_p5 import AITNode as _AIT
+            calc = _AIT(
+                intent="CALCULATE",
+                name=node.name,
+                op=node.op,
+                left=node.left,
+                right=node.right,
+                llvm_type=lt,
+            )
+            self._emit_calculate(calc)
+            return
+
         if lt == "i8*":
             # Heap string — malloc + strcpy
             if val:
@@ -348,16 +363,40 @@ class LLVMGeneratorP5:
             self._emit("")
             return
 
-        # Numeric
+        # Numeric value
         if val is not None:
-            const_val = str(val)
-            if lt == "double" and "." not in const_val:
-                const_val += ".0"
-            reg = self._ssa.define(mangled, lt, is_const=True, const_val=const_val)
+            # FIX: check if val is a variable reference (identifier), not a literal
+            if re.match(r'^[a-zA-Z_]\w*$', str(val)):
+                # Variable reference — look up SSA and copy its current value
+                m_src        = self._m_str(str(val))
+                src_val, src_t = self._ssa.get_operand(m_src)
+                if src_t == "i32" and lt == "double":
+                    # Need integer→float cast
+                    cast_reg = self._fresh("itof")
+                    self._emit(f"{cast_reg} = sitofp i32 {src_val} to double")
+                    reg = self._ssa.define(mangled, lt)
+                    self._ssa.update(mangled, cast_reg, lt)
+                elif src_t == "double" and lt == "i32":
+                    cast_reg = self._fresh("ftoi")
+                    self._emit(f"{cast_reg} = fptosi double {src_val} to i32")
+                    reg = self._ssa.define(mangled, lt)
+                    self._ssa.update(mangled, cast_reg, lt)
+                else:
+                    # Same type — propagate as constant reference
+                    reg = self._ssa.define(mangled, lt, is_const=True, const_val=src_val)
+                self._emit_c(f"  SSA {reg} = {val} (ref → {src_val}) : {lt}")
+            else:
+                # Numeric literal
+                const_val = str(val)
+                # FIX: only append ".0" if the value is a pure integer literal (not a name)
+                if lt == "double" and "." not in const_val and re.match(r'^-?\d+$', const_val):
+                    const_val += ".0"
+                reg = self._ssa.define(mangled, lt, is_const=True, const_val=const_val)
+                self._emit_c(f"  SSA {reg} = {const_val} : {lt}")
         else:
             dv  = default_for_type(lt)
             reg = self._ssa.define(mangled, lt, is_const=True, const_val=dv)
-        self._emit_c(f"  SSA {reg} = {val or default_for_type(lt)} : {lt}")
+            self._emit_c(f"  SSA {reg} = {dv} (default) : {lt}")
         self._emit("")
 
     # ── Emit CALCULATE ────────────────────────────────────────────────────────

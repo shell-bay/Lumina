@@ -420,21 +420,26 @@ LUMINA_GRAMMAR_P5 = r"""
     // ── Create variable ───────────────────────────────────────────────────────
     create_stmt: CREATE_KW TYPE_KW CALLED_KW IDENT WITH_KW VALUE_KW value_expr
                | CREATE_KW TYPE_KW CALLED_KW IDENT AS_KW QUOTED_STRING
-    CREATE_KW:  /create a\b|make a\b|define a\b|declare a\b|give me a\b|let there be a\b/i
+               | CREATE_FLEX_KW IDENT WITH_KW value_expr            // FIX: flexible shorthand
+               | CREATE_FLEX_KW IDENT AS_KW QUOTED_STRING           // FIX: short string form
+    CREATE_KW:      /create a\b|make a\b|define a\b|declare a\b|give me a\b|let there be a\b/i
+    CREATE_FLEX_KW: /create\b|make\b|set\b|let\b/i                  // FIX: short-form trigger
     CALLED_KW:  /called\b|named\b/i
     WITH_KW:    /with\b/i
     VALUE_KW:   /value\b/i
     AS_KW:      /as\b/i
     TYPE_KW:    /number\b|integer\b|decimal\b|float\b|real number\b|text\b|word\b|sentence\b|truth\b|boolean\b|flag\b|count\b|whole number\b/i
 
-    value_expr: NUMBER
+    // value_expr: now supports binary expressions — FIX: was dropping RHS of x * y
+    value_expr: operand MATH_OP operand  -> bin_expr_val
+              | NUMBER
               | SIGNED_FLOAT
               | IDENT
 
     // ── Calculate ─────────────────────────────────────────────────────────────
     calc_stmt: CALC_KW IDENT AS_KW operand MATH_OP operand
     CALC_KW:   /calculate\b|compute\b|figure out\b|work out\b|find\b|determine\b|evaluate\b|solve\b/i
-    MATH_OP:   /plus\b|added to\b|minus\b|times\b|multiplied by\b|divided by\b|over\b|mod\b|modulo\b|remainder of\b/i
+    MATH_OP:   /\+|-|\*|\/|plus\b|added to\b|minus\b|times\b|multiplied by\b|divided by\b|over\b|mod\b|modulo\b|remainder of\b/i
 
     operand: NUMBER | SIGNED_FLOAT | IDENT
 
@@ -535,11 +540,18 @@ _COMP_MAP = {
 }
 
 _MATH_MAP = {
+    # English operators
     "plus": "ADD", "added to": "ADD",
     "minus": "SUBTRACT",
     "times": "MULTIPLY", "multiplied by": "MULTIPLY",
     "divided by": "DIVIDE", "over": "DIVIDE",
     "mod": "MODULO", "modulo": "MODULO", "remainder of": "MODULO",
+    # Symbolic operators — FIX: accept standard math symbols
+    "+": "ADD",
+    "-": "SUBTRACT",
+    "*": "MULTIPLY",
+    "/": "DIVIDE",
+    "%": "MODULO",
 }
 
 def _resolve_comp(s: str) -> str:
@@ -618,27 +630,66 @@ class LuminaTransformerP5(Transformer if LARK_AVAILABLE else object):
     # ── create_stmt ─────────────────────────────────────────────────────────
     def create_stmt(self, items):
         type_kw = val = name = None
+        bin_op = bin_left = bin_right = None
         is_heap = False
         for it in items:
             if isinstance(it, Token):
                 if it.type == "TYPE_KW":
                     type_kw = str(it).lower()
-                elif it.type == "IDENT":
+                elif it.type == "IDENT" and name is None:
                     name = str(it).lower()
                 elif it.type == "QUOTED_STRING":
                     val = str(it)[1:-1]  # strip quotes
                     is_heap = True
-            elif isinstance(it, AITNode) and it.intent == "__value__":
-                val = it.value
-        llvm_t = _resolve_type(type_kw or "") if type_kw else infer_type(val)
-        return AITNode(
+                # FIX: ignore CREATE_FLEX_KW token — name will be captured via IDENT
+            elif isinstance(it, AITNode):
+                if it.intent == "__value__":
+                    val = it.value
+                elif it.intent == "__binexpr__":
+                    # FIX: binary expression in value position — capture op/left/right
+                    bin_op    = it.op
+                    bin_left  = it.left
+                    bin_right = it.right
+
+        # Type inference: use explicit keyword if given, else infer from value/expression
+        if type_kw:
+            llvm_t = _resolve_type(type_kw)
+        elif bin_left is not None or bin_right is not None:
+            lt = infer_type(bin_left)
+            rt = infer_type(bin_right)
+            llvm_t = widen_type(lt, rt)
+        else:
+            llvm_t = infer_type(val)
+
+        node = AITNode(
             intent="CREATE_VAR", name=name, value=val,
             llvm_type=llvm_t, is_heap=is_heap,
         )
+        # FIX: attach binary op info so codegen can emit arithmetic
+        if bin_op:
+            node.op    = bin_op
+            node.left  = bin_left
+            node.right = bin_right
+        return node
 
     def value_expr(self, items):
         tok = items[0]
         return AITNode(intent="__value__", value=str(tok))
+
+    def bin_expr_val(self, items):
+        # FIX: handles binary expression in value position (x * y, etc.)
+        operands = [it for it in items if isinstance(it, AITNode) and it.intent == "__operand__"]
+        op_tok   = next((it for it in items if isinstance(it, Token) and it.type == "MATH_OP"), None)
+        left_val  = operands[0].value if len(operands) > 0 else "0"
+        right_val = operands[1].value if len(operands) > 1 else "0"
+        op_str   = str(op_tok).lower().strip() if op_tok else "plus"
+        return AITNode(
+            intent="__binexpr__",
+            op=_resolve_math(op_str),
+            left=left_val,
+            right=right_val,
+            value=left_val,   # keep left as nominal value
+        )
 
     # ── calc_stmt ────────────────────────────────────────────────────────────
     def calc_stmt(self, items):
@@ -829,6 +880,14 @@ class RegexFallbackParser:
         r'(?:\s+with\s+value\s+(?P<val>\S+)|\s+as\s+(?P<str>[\'"].*[\'"]))?',
         re.IGNORECASE
     )
+    # FIX: short-form — "create x with 100" or "create result with x * y"
+    _CREATE_SHORT_RE = re.compile(
+        r'^(?:create|make|set|let)\s+(?P<n>[a-z_]\w*)\s+with\s+'
+        r'(?P<left>[a-z_]\w*|-?\d+(?:\.\d+)?)'
+        r'(?:\s*(?P<op>[+\-*/]|plus|minus|times|divided\s+by|over)\s*'
+        r'(?P<right>[a-z_]\w*|-?\d+(?:\.\d+)?))?$',
+        re.IGNORECASE
+    )
     _PRINT_RE = re.compile(
         r'^(?:show me|show|print|display|output|say|log|reveal|tell me)\s+(?P<name>\w+)',
         re.IGNORECASE
@@ -837,10 +896,11 @@ class RegexFallbackParser:
         r'^(?:show me|show|print|display|output|say|log|reveal|tell me)\s+[\'"](?P<text>[^\'"]+)[\'"]',
         re.IGNORECASE
     )
+    # FIX: calc accepts symbolic operators +, -, *, / alongside English words
     _CALC_RE = re.compile(
         r'^(?:calculate|compute|figure out|work out|find|determine|evaluate|solve)\s+'
-        r'(?P<name>\w+)\s+as\s+(?P<left>\w+|\d+(?:\.\d+)?)\s+'
-        r'(?P<op>plus|added to|minus|times|multiplied by|divided by|over|mod|modulo|remainder of)\s+'
+        r'(?P<n>\w+)\s+as\s+(?P<left>\w+|\d+(?:\.\d+)?)\s+'
+        r'(?P<op>\+|-|\*|\/|plus|added to|minus|times|multiplied by|divided by|over|mod|modulo|remainder of)\s+'
         r'(?P<right>\w+|\d+(?:\.\d+)?)',
         re.IGNORECASE
     )
@@ -902,29 +962,49 @@ class RegexFallbackParser:
         # USE
         m = self._USE_RE.match(stripped)
         if m:
-            return AITNode(intent="MODULE_USE", module_name=m.group("name").lower().strip(),
+            return AITNode(intent="MODULE_USE", module_name=m.group("n").lower().strip(),
                            source_line=lineno, source_text=stripped)
 
         # IMPORT_CALL
         m = self._IMPORT_CALL_RE.match(stripped)
         if m:
             return AITNode(intent="IMPORT_CALL",
-                           name=m.group("result").lower(),
+                           name=m.group("r").lower(),
                            call_fn=m.group("func").lower().strip(),
                            call_args=[m.group("arg").lower()],
                            llvm_type="double",
                            source_line=lineno, source_text=stripped)
 
-        # CREATE
+        # CREATE (verbose form)
         m = self._CREATE_RE.match(stripped)
         if m:
             type_str = m.group("type").lower()
             val = m.group("val") or (m.group("str")[1:-1] if m.group("str") else None)
             is_heap = bool(m.group("str"))
             lt = _resolve_type(type_str)
-            return AITNode(intent="CREATE_VAR", name=m.group("name").lower(),
+            return AITNode(intent="CREATE_VAR", name=m.group("n").lower(),
                            value=val, llvm_type=lt, is_heap=is_heap,
                            source_line=lineno, source_text=stripped)
+
+        # FIX: CREATE short-form — "create x with 100" or "create result with x * y"
+        m = self._CREATE_SHORT_RE.match(stripped)
+        if m:
+            left  = m.group("left")
+            right = m.group("right") if m.group("right") else None
+            op_s  = m.group("op")    if m.group("op")    else None
+            name  = m.group("n").lower()
+            if op_s and right:
+                # Binary expression — infer type from operands
+                op  = _resolve_math(op_s.strip())
+                lt  = widen_type(infer_type(left), infer_type(right))
+                node = AITNode(intent="CREATE_VAR", name=name, value=left,
+                               llvm_type=lt, op=op, left=left.lower(), right=right.lower(),
+                               source_line=lineno, source_text=stripped)
+            else:
+                lt   = infer_type(left)
+                node = AITNode(intent="CREATE_VAR", name=name, value=left,
+                               llvm_type=lt, source_line=lineno, source_text=stripped)
+            return node
 
         # PRINT LITERAL
         m = self._PRINT_LIT_RE.match(stripped)
@@ -935,7 +1015,7 @@ class RegexFallbackParser:
         # PRINT
         m = self._PRINT_RE.match(stripped)
         if m:
-            return AITNode(intent="PRINT", name=m.group("name").lower(),
+            return AITNode(intent="PRINT", name=m.group("n").lower(),
                            source_line=lineno, source_text=stripped)
 
         # CALCULATE
@@ -945,7 +1025,7 @@ class RegexFallbackParser:
             lt = infer_type(m.group("left"))
             rt = infer_type(m.group("right"))
             return AITNode(intent="CALCULATE",
-                           name=m.group("name").lower(),
+                           name=m.group("n").lower(),
                            op=op,
                            left=m.group("left").lower(),
                            right=m.group("right").lower(),
